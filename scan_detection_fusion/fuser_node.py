@@ -1,31 +1,62 @@
 #!/usr/bin/env python3
 """
-scan_detection_fusion/fuser_node.py
+scan_detection_fusion/fuser_node.py  —  LiDAR + Camera fusion node (canonical)
+================================================================================
 
-Fuses 2D LiDAR scan with camera detections to produce named object
-positions in both robot-frame and map-frame coordinates.
+Thin ROS wrapper around LidarCameraFuser.  All fusion math lives in
+lidar_camera_fuser.py; this file handles only ROS I/O: subscriptions,
+publishers, TF lookups, parameter reads, and message building.
 
-Algorithm (per detection cycle):
-  1. For each camera detection (label + horizontal angular range):
-       - Find all LiDAR scan points whose angle falls within the
-         detection's angular range (plus a small expansion margin)
-       - Take the lower-quartile distance of valid points
-         (picks the nearest cluster, which is typically the object)
-       - Compute object position in robot frame: (d·cosθ, d·sinθ)
-       - Transform to map frame using current AMCL pose
-  2. Maintain object_registry dict keyed by label (with _N suffix for
-     multiple instances). Apply EMA smoothing on repeated detections.
-  3. Expire objects not seen for stale_sec seconds.
-  4. Publish registry as JSON + RViz MarkerArray (cylinders + labels)
+Build & run
+-----------
+  # From the workspace root (one level above scan_detection_fusion/):
+  colcon build --packages-select scan_detection_fusion
+  source install/setup.bash
+  ros2 run scan_detection_fusion fuser_node
 
-Topics subscribed:
-  /scan                              (sensor_msgs/LaserScan)
-  /camera/detections                 (std_msgs/String)  JSON from detector_node
-  /amcl_pose                         (geometry_msgs/PoseWithCovarianceStamped)
+Upstream nodes that must already be running
+-------------------------------------------
+  • LiDAR driver          — publishes /scan (sensor_msgs/LaserScan)
+  • Camera detector node  — publishes /camera/detections (std_msgs/String, JSON)
+  • SLAM Toolbox or AMCL  — broadcasts TF map → base_footprint
+                            (AMCL also publishes /amcl_pose as a secondary source)
 
-Topics published:
-  /detected_objects                  (std_msgs/String)  JSON object registry
-  /object_markers                    (visualization_msgs/MarkerArray)
+Topics subscribed
+-----------------
+  /scan                   sensor_msgs/LaserScan
+  /camera/detections      std_msgs/String         (JSON from detector_node)
+  /amcl_pose              geometry_msgs/PoseWithCovarianceStamped  (optional)
+
+Topics published
+----------------
+  /detected_objects       std_msgs/String          (JSON registry, 2 Hz)
+  /object_markers         visualization_msgs/MarkerArray
+  /object_footprints      geometry_msgs/PolygonStamped  (one per object, for Nav2)
+
+Key parameters and defaults
+---------------------------
+  stale_sec               5.0     seconds before an unseen object is dropped
+  publish_hz              2.0     publish timer frequency
+  lidar_angle_offset_deg  0.0     LiDAR mounting angle correction (°)
+  min_detection_range     0.20    ignore LiDAR returns closer than this (m)
+  max_detection_range     6.0     ignore LiDAR returns farther than this (m)
+  angle_expand_deg        4.0     angular padding added to each bbox edge (°)
+  ema_alpha               0.35    EMA weight on newest measurement (0–1)
+  marker_lifetime_sec     4.0     RViz marker lifetime (s)
+  map_frame               'map'
+  base_frame              'base_footprint'
+  estimator               'q1'    distance estimator: q1 | median | mean |
+                                  trimmed_mean | adaptive
+  use_parallax_correction False   enable camera–LiDAR bearing correction
+  parallax_dx             0.0     camera–LiDAR lateral offset (m)
+  parallax_dy             0.0     camera–LiDAR forward offset (m)
+  use_time_sync           False   enable ApproximateTimeSynchronizer
+  sync_slop_sec           0.05    time-sync tolerance window (s)
+  use_spatial_keys        True    grid-cell EMA keys (prevents ID collisions)
+  spatial_bin_size        0.75    grid cell size for spatial keys (m)
+  publish_footprints      True    publish PolygonStamped on /object_footprints
+  footprint_width_refine  True    widen footprint when LiDAR arc implies it
+  footprint_refine_tol    0.20    tolerance before width override kicks in (fraction)
 """
 
 import json
@@ -38,23 +69,15 @@ from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
-from geometry_msgs.msg import PoseWithCovarianceStamped
+from geometry_msgs.msg import PoseWithCovarianceStamped, PolygonStamped, Point32
 from visualization_msgs.msg import Marker, MarkerArray
 from builtin_interfaces.msg import Duration
 
+from tf2_ros import (Buffer, TransformListener,
+                     LookupException, ConnectivityException, ExtrapolationException)
+from message_filters import ApproximateTimeSynchronizer, Subscriber
 
-# ── Utility ───────────────────────────────────────────────────────────────────
-
-def quat_to_yaw(qx: float, qy: float, qz: float, qw: float) -> float:
-    """Extract yaw angle (radians) from a quaternion."""
-    siny = 2.0 * (qw * qz + qx * qy)
-    cosy = 1.0 - 2.0 * (qy * qy + qz * qz)
-    return math.atan2(siny, cosy)
-
-
-def normalize_angle(a: float) -> float:
-    """Wrap angle to [-pi, pi]."""
-    return math.atan2(math.sin(a), math.cos(a))
+from scan_detection_fusion.lidar_camera_fuser import LidarCameraFuser, quat_to_yaw
 
 
 # ── Node ──────────────────────────────────────────────────────────────────────
@@ -63,37 +86,99 @@ class FuserNode(Node):
     def __init__(self):
         super().__init__('fuser_node')
 
-        # ── Parameters ──────────────────────────────────────────────────────
+        # ── Parameters: base fusion ──────────────────────────────────────────
         self.declare_parameter('stale_sec',               5.0)
         self.declare_parameter('publish_hz',              2.0)
-        self.declare_parameter('lidar_angle_offset_deg',  0.0)   # tune if lidar 0° ≠ forward
-        self.declare_parameter('min_detection_range',     0.20)  # m — ignore closer points
-        self.declare_parameter('max_detection_range',     6.0)   # m — ignore farther points
-        self.declare_parameter('angle_expand_deg',        4.0)   # expand bbox angle each side
-        self.declare_parameter('ema_alpha',               0.35)  # position smoothing (0=frozen)
+        self.declare_parameter('lidar_angle_offset_deg',  0.0)
+        self.declare_parameter('min_detection_range',     0.20)
+        self.declare_parameter('max_detection_range',     6.0)
+        self.declare_parameter('angle_expand_deg',        4.0)
+        self.declare_parameter('ema_alpha',               0.35)
         self.declare_parameter('marker_lifetime_sec',     4.0)
+        self.declare_parameter('map_frame',               'map')
+        self.declare_parameter('base_frame',              'base_footprint')
 
-        self.stale_sec      = float(self.get_parameter('stale_sec').value)
-        self.pub_hz         = float(self.get_parameter('publish_hz').value)
-        self.lidar_offset   = math.radians(float(self.get_parameter('lidar_angle_offset_deg').value))
-        self.min_range      = float(self.get_parameter('min_detection_range').value)
-        self.max_range      = float(self.get_parameter('max_detection_range').value)
-        self.angle_expand   = math.radians(float(self.get_parameter('angle_expand_deg').value))
-        self.ema_alpha      = float(self.get_parameter('ema_alpha').value)
-        self.marker_life    = float(self.get_parameter('marker_lifetime_sec').value)
+        # ── Parameters: estimator selection ──────────────────────────────────
+        self.declare_parameter('estimator',               'q1')
 
-        # ── State ────────────────────────────────────────────────────────────
-        self.latest_scan:   LaserScan = None
-        self.robot_x:       float = 0.0
-        self.robot_y:       float = 0.0
-        self.robot_yaw:     float = 0.0
-        self.has_pose:      bool  = False
+        # ── Parameters: parallax correction ──────────────────────────────────
+        self.declare_parameter('use_parallax_correction', False)
+        self.declare_parameter('parallax_dx',             0.0)
+        self.declare_parameter('parallax_dy',             0.0)
 
-        # key → { label, key, distance, angle_deg, map_x, map_y,
-        #          confidence, last_seen, friendly_label }
-        self.registry: dict = {}
+        # ── Parameters: timestamp synchronization ─────────────────────────────
+        self.declare_parameter('use_time_sync',           False)
+        self.declare_parameter('sync_slop_sec',           0.05)
 
-        # ── QoS ─────────────────────────────────────────────────────────────
+        # ── Parameters: spatial-bin EMA keys ─────────────────────────────────
+        self.declare_parameter('use_spatial_keys',        True)
+        self.declare_parameter('spatial_bin_size',        0.75)
+
+        # ── Parameters: footprint reconstruction ─────────────────────────────
+        self.declare_parameter('publish_footprints',      True)
+        self.declare_parameter('footprint_width_refine',  True)
+        self.declare_parameter('footprint_refine_tol',    0.20)
+
+        # ── Resolve parameters ───────────────────────────────────────────────
+        stale_sec    = float(self.get_parameter('stale_sec').value)
+        pub_hz       = float(self.get_parameter('publish_hz').value)
+        lidar_offset = math.radians(float(self.get_parameter('lidar_angle_offset_deg').value))
+        min_range    = float(self.get_parameter('min_detection_range').value)
+        max_range    = float(self.get_parameter('max_detection_range').value)
+        angle_expand = math.radians(float(self.get_parameter('angle_expand_deg').value))
+        ema_alpha    = float(self.get_parameter('ema_alpha').value)
+
+        self.marker_life = float(self.get_parameter('marker_lifetime_sec').value)
+        self.map_frame   = str(self.get_parameter('map_frame').value)
+        self.base_frame  = str(self.get_parameter('base_frame').value)
+        self.pub_hz      = pub_hz
+
+        estimator    = str(self.get_parameter('estimator').value)
+
+        use_parallax = bool(self.get_parameter('use_parallax_correction').value)
+        parallax_dx  = float(self.get_parameter('parallax_dx').value)
+        parallax_dy  = float(self.get_parameter('parallax_dy').value)
+
+        self.use_time_sync = bool(self.get_parameter('use_time_sync').value)
+        self.sync_slop     = float(self.get_parameter('sync_slop_sec').value)
+
+        use_spatial_keys = bool(self.get_parameter('use_spatial_keys').value)
+        spatial_bin_size = float(self.get_parameter('spatial_bin_size').value)
+
+        self.publish_footprints = bool(self.get_parameter('publish_footprints').value)
+        footprint_width_refine  = bool(self.get_parameter('footprint_width_refine').value)
+        footprint_refine_tol    = float(self.get_parameter('footprint_refine_tol').value)
+
+        # ── Fusion class (all math lives here) ──────────────────────────────
+        self.fuser = LidarCameraFuser(
+            min_range    = min_range,
+            max_range    = max_range,
+            lidar_offset = lidar_offset,
+            angle_expand = angle_expand,
+            ema_alpha    = ema_alpha,
+            stale_sec    = stale_sec,
+            estimator    = estimator,
+            use_parallax = use_parallax,
+            parallax_dx  = parallax_dx,
+            parallax_dy  = parallax_dy,
+            use_spatial_keys       = use_spatial_keys,
+            spatial_bin_size       = spatial_bin_size,
+            footprint_width_refine = footprint_width_refine,
+            footprint_refine_tol   = footprint_refine_tol,
+        )
+
+        # ── Pose state (updated from TF / amcl_pose) ─────────────────────────
+        self.latest_scan: LaserScan = None
+        self.robot_x:    float = 0.0
+        self.robot_y:    float = 0.0
+        self.robot_yaw:  float = 0.0
+        self.has_pose:   bool  = False
+
+        # ── TF2 listener (primary pose source — works with SLAM + AMCL) ──────
+        self.tf_buffer   = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+        # ── QoS ──────────────────────────────────────────────────────────────
         sensor_qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             history=QoSHistoryPolicy.KEEP_LAST,
@@ -101,31 +186,54 @@ class FuserNode(Node):
         )
 
         # ── Subscribers ──────────────────────────────────────────────────────
-        self.create_subscription(LaserScan, '/scan', self._cb_scan, sensor_qos)
-        self.create_subscription(String, '/camera/detections', self._cb_detections, 10)
+        if self.use_time_sync:
+            # Synchronized scan + detections; TF lookup at detection stamp
+            self.scan_sub = Subscriber(self, LaserScan, '/scan', qos_profile=sensor_qos)
+            self.det_sub  = Subscriber(self, String,    '/camera/detections')
+            self.sync = ApproximateTimeSynchronizer(
+                [self.scan_sub, self.det_sub],
+                queue_size=10,
+                slop=self.sync_slop,
+                allow_headerless=True   # String has no native header; JSON timestamp used
+            )
+            self.sync.registerCallback(self._cb_synced)
+            self.get_logger().info(f'Time-sync ENABLED, slop={self.sync_slop:.3f}s')
+        else:
+            # Default: independent callbacks, TF lookup at publish time
+            self.create_subscription(LaserScan, '/scan', self._cb_scan, sensor_qos)
+            self.create_subscription(String, '/camera/detections', self._cb_detections, 10)
+
+        # /amcl_pose kept as secondary pose source (works alongside SLAM TF)
         self.create_subscription(
-            PoseWithCovarianceStamped, '/amcl_pose', self._cb_pose, 10
+            PoseWithCovarianceStamped, '/amcl_pose', self._cb_amcl_pose, 10
         )
 
         # ── Publishers ───────────────────────────────────────────────────────
-        self.obj_pub    = self.create_publisher(String,      '/detected_objects', 10)
-        self.marker_pub = self.create_publisher(MarkerArray, '/object_markers',   10)
+        self.obj_pub       = self.create_publisher(String,         '/detected_objects',  10)
+        self.marker_pub    = self.create_publisher(MarkerArray,    '/object_markers',    10)
+        self.footprint_pub = self.create_publisher(PolygonStamped, '/object_footprints', 10)
 
         # ── Timer ────────────────────────────────────────────────────────────
         self.timer = self.create_timer(1.0 / self.pub_hz, self._publish_cb)
 
         self.get_logger().info(
-            f'fuser_node ready  stale={self.stale_sec}s  '
-            f'range=[{self.min_range},{self.max_range}]m  '
-            f'expand=±{math.degrees(self.angle_expand):.1f}°  hz={self.pub_hz}'
+            f'fuser_node ready\n'
+            f'  estimator={self.fuser.estimator}  '
+            f'spatial_keys={self.fuser.use_spatial_keys}  '
+            f'(bin={self.fuser.spatial_bin_size}m)\n'
+            f'  parallax={self.fuser.use_parallax} '
+            f'dx={self.fuser.parallax_dx} dy={self.fuser.parallax_dy}\n'
+            f'  time_sync={self.use_time_sync}  '
+            f'footprints={self.publish_footprints}\n'
+            f'  stale={self.fuser.stale_sec}s  '
+            f'range=[{self.fuser.min_range},{self.fuser.max_range}]m  '
+            f'expand=±{math.degrees(self.fuser.angle_expand):.1f}°  hz={self.pub_hz}'
         )
 
-    # ── Subscriber callbacks ──────────────────────────────────────────────────
+    # ── Pose handling ─────────────────────────────────────────────────────────
 
-    def _cb_scan(self, msg: LaserScan):
-        self.latest_scan = msg
-
-    def _cb_pose(self, msg: PoseWithCovarianceStamped):
+    def _cb_amcl_pose(self, msg: PoseWithCovarianceStamped):
+        """Secondary pose update — used when AMCL is running alongside TF."""
         p = msg.pose.pose
         self.robot_x   = p.position.x
         self.robot_y   = p.position.y
@@ -135,8 +243,37 @@ class FuserNode(Node):
         )
         self.has_pose = True
 
+    def _update_pose_from_tf(self, stamp=None):
+        """
+        Primary pose update — lookup map → base_frame via TF2.
+        Works with SLAM Toolbox (TF only) and AMCL (TF + /amcl_pose).
+        stamp: if provided, look up at that specific time (used in time-sync mode).
+        Returns True on success.
+        """
+        try:
+            target_stamp = stamp if stamp is not None else rclpy.time.Time()
+            tf = self.tf_buffer.lookup_transform(
+                self.map_frame, self.base_frame, target_stamp,
+                timeout=rclpy.duration.Duration(seconds=0.05)
+            )
+            t = tf.transform.translation
+            r = tf.transform.rotation
+            self.robot_x   = t.x
+            self.robot_y   = t.y
+            self.robot_yaw = quat_to_yaw(r.x, r.y, r.z, r.w)
+            self.has_pose  = True
+            return True
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            return False
+
+    # ── Scan / detection callbacks ────────────────────────────────────────────
+
+    def _cb_scan(self, msg: LaserScan):
+        """Default mode: store latest scan for use at detection time."""
+        self.latest_scan = msg
+
     def _cb_detections(self, msg: String):
-        """Called every time detector_node publishes. Run fusion immediately."""
+        """Default mode: fuse using latest stored scan and latest TF pose."""
         if self.latest_scan is None:
             return
         try:
@@ -144,154 +281,93 @@ class FuserNode(Node):
         except Exception as e:
             self.get_logger().warn(f'Detection JSON parse error: {e}')
             return
-        self._fuse(data)
 
-    # ── Fusion core ───────────────────────────────────────────────────────────
-
-    def _lidar_range_for_angle(self, center_angle: float, half_width: float):
-        """
-        Return the lower-quartile LiDAR distance for all scan points
-        whose angle falls in [center_angle - half_width, center_angle + half_width].
-        Returns None if no valid points found.
-        """
         scan = self.latest_scan
-        lo = normalize_angle(center_angle - half_width)
-        hi = normalize_angle(center_angle + half_width)
+        self.fuser.fuse(
+            detections      = data.get('detections', []),
+            ranges          = scan.ranges,
+            angle_min       = scan.angle_min,
+            angle_increment = scan.angle_increment,
+            robot_x         = self.robot_x,
+            robot_y         = self.robot_y,
+            robot_yaw       = self.robot_yaw,
+            has_pose        = self.has_pose,
+        )
 
-        valid = []
-        for i, r in enumerate(scan.ranges):
-            if not math.isfinite(r):
-                continue
-            if r < self.min_range or r > self.max_range:
-                continue
-            raw_angle = scan.angle_min + i * scan.angle_increment + self.lidar_offset
-            angle = normalize_angle(raw_angle)
+    def _cb_synced(self, scan_msg: LaserScan, det_msg: String):
+        """
+        Time-sync mode: scan and detection arrive aligned.
+        TF is looked up at the camera capture timestamp from the JSON payload,
+        then fuse() is called with the timestamp-matched scan and pose.
+        """
+        self.latest_scan = scan_msg
+        try:
+            data = json.loads(det_msg.data)
+        except Exception as e:
+            self.get_logger().warn(f'Detection JSON parse error: {e}')
+            return
 
-            # Handle wrap-around when range crosses ±π
-            if lo <= hi:
-                in_range = lo <= angle <= hi
-            else:
-                in_range = angle >= lo or angle <= hi
+        cap_t = data.get('timestamp', None)
+        if cap_t is not None:
+            stamp = rclpy.time.Time(
+                seconds=int(cap_t),
+                nanoseconds=int((cap_t - int(cap_t)) * 1e9)
+            )
+            self._update_pose_from_tf(stamp=stamp.to_msg())
+        else:
+            self._update_pose_from_tf()
 
-            if in_range:
-                valid.append(r)
-
-        if not valid:
-            return None
-
-        valid.sort()
-        # Use lower-quartile: tends to pick the nearest real surface
-        return valid[max(0, len(valid) // 4)]
-
-    def _fuse(self, data: dict):
-        """Run one fusion cycle for a set of camera detections."""
-        detections = data.get('detections', [])
-        now = time.time()
-        seen_labels: dict = {}   # track count per label for unique keys
-
-        for det in detections:
-            label        = det.get('label', 'unknown')
-            friendly     = det.get('friendly_label', label)
-            confidence   = det.get('confidence', 0.0)
-            center_angle = float(det.get('center_angle_rad', 0.0))
-            left_angle   = float(det.get('left_angle_rad',   center_angle))
-            right_angle  = float(det.get('right_angle_rad',  center_angle))
-
-            # Angular half-width of the bounding box + expansion margin
-            bbox_half = abs(left_angle - right_angle) / 2.0
-            half_width = bbox_half + self.angle_expand
-
-            distance = self._lidar_range_for_angle(center_angle, half_width)
-            if distance is None:
-                self.get_logger().debug(
-                    f'No LiDAR match for {label} at {math.degrees(center_angle):.1f}°',
-                    throttle_duration_sec=2.0
-                )
-                continue
-
-            # Robot-frame Cartesian position of the object
-            obj_rx = distance * math.cos(center_angle)
-            obj_ry = distance * math.sin(center_angle)
-
-            # Map-frame position (rotate by robot yaw then translate)
-            if self.has_pose:
-                cy = math.cos(self.robot_yaw)
-                sy = math.sin(self.robot_yaw)
-                map_x = self.robot_x + cy * obj_rx - sy * obj_ry
-                map_y = self.robot_y + sy * obj_rx + cy * obj_ry
-            else:
-                # Fallback: use robot-frame coords directly
-                map_x = obj_rx
-                map_y = obj_ry
-
-            # Build unique key (chair, chair_1, chair_2, …)
-            count = seen_labels.get(label, 0)
-            key   = label if count == 0 else f'{label}_{count}'
-            seen_labels[label] = count + 1
-
-            # EMA smooth if key already exists
-            if key in self.registry:
-                old = self.registry[key]
-                a   = self.ema_alpha
-                map_x    = a * map_x    + (1 - a) * old['map_x']
-                map_y    = a * map_y    + (1 - a) * old['map_y']
-                distance = a * distance + (1 - a) * old['distance']
-
-            self.registry[key] = {
-                'label':         label,
-                'friendly_label': friendly,
-                'key':           key,
-                'distance':      round(distance, 2),
-                'angle_deg':     round(math.degrees(center_angle), 1),
-                'map_x':         round(map_x, 3),
-                'map_y':         round(map_y, 3),
-                'confidence':    round(confidence, 3),
-                'last_seen':     now,
-            }
-
-        # Remove stale entries
-        stale = [k for k, v in self.registry.items()
-                 if now - v['last_seen'] > self.stale_sec]
-        for k in stale:
-            del self.registry[k]
+        self.fuser.fuse(
+            detections      = data.get('detections', []),
+            ranges          = scan_msg.ranges,
+            angle_min       = scan_msg.angle_min,
+            angle_increment = scan_msg.angle_increment,
+            robot_x         = self.robot_x,
+            robot_y         = self.robot_y,
+            robot_yaw       = self.robot_yaw,
+            has_pose        = self.has_pose,
+        )
 
     # ── Publish cycle ─────────────────────────────────────────────────────────
 
     def _publish_cb(self):
-        # Expire before publishing
-        now = time.time()
-        stale = [k for k, v in self.registry.items()
-                 if now - v['last_seen'] > self.stale_sec]
-        for k in stale:
-            del self.registry[k]
+        # Default mode: refresh pose from latest TF at publish rate
+        if not self.use_time_sync:
+            self._update_pose_from_tf()
 
-        # JSON
+        # Expire stale objects
+        now = time.time()
+        self.fuser.expire_stale(now)
+
+        # Publish JSON registry
         payload = String()
         payload.data = json.dumps({
-            'timestamp': now,
+            'timestamp':   now,
+            'pose_source': 'tf' if self.has_pose else 'none',
             'robot_pose': {
                 'x':       round(self.robot_x, 3),
                 'y':       round(self.robot_y, 3),
                 'yaw_deg': round(math.degrees(self.robot_yaw), 1),
             },
-            'objects': list(self.registry.values()),
+            'objects': list(self.fuser.registry.values()),
         })
         self.obj_pub.publish(payload)
 
-        # RViz markers
-        self._publish_markers()
-
-    def _publish_markers(self):
-        arr   = MarkerArray()
+        # Publish markers and footprints
         stamp = self.get_clock().now().to_msg()
-        lt    = Duration()
+        self._publish_markers(stamp)
+        self._publish_footprints(stamp)
+
+    def _publish_markers(self, stamp):
+        arr = MarkerArray()
+        lt  = Duration()
         lt.sec = int(self.marker_life)
 
-        for idx, obj in enumerate(self.registry.values()):
-            # ── Cylinder at object position ──────────────────────────────────
+        for idx, obj in enumerate(self.fuser.registry.values()):
+            # Cylinder at object position
             m = Marker()
             m.header.stamp    = stamp
-            m.header.frame_id = 'map'
+            m.header.frame_id = self.map_frame
             m.ns              = 'fused_objects'
             m.id              = idx
             m.type            = Marker.CYLINDER
@@ -310,10 +386,10 @@ class FuserNode(Node):
             m.lifetime = lt
             arr.markers.append(m)
 
-            # ── Text label above cylinder ─────────────────────────────────────
+            # Text label above cylinder
             t = Marker()
             t.header.stamp    = stamp
-            t.header.frame_id = 'map'
+            t.header.frame_id = self.map_frame
             t.ns              = 'fused_labels'
             t.id              = idx + 1000
             t.type            = Marker.TEXT_VIEW_FACING
@@ -332,6 +408,31 @@ class FuserNode(Node):
             arr.markers.append(t)
 
         self.marker_pub.publish(arr)
+
+    def _publish_footprints(self, stamp):
+        """Publish one PolygonStamped per tracked object on /object_footprints."""
+        if not self.publish_footprints:
+            return
+        for obj in self.fuser.registry.values():
+            corners = self.fuser.compute_footprint(
+                obj['label'],
+                obj['distance'],
+                obj.get('angle_span_rad', 0.0),
+                obj['map_x'],
+                obj['map_y'],
+                self.robot_x,
+                self.robot_y,
+            )
+            poly = PolygonStamped()
+            poly.header.stamp    = stamp
+            poly.header.frame_id = self.map_frame
+            for (cx, cy) in corners:
+                p = Point32()
+                p.x = float(cx)
+                p.y = float(cy)
+                p.z = 0.0
+                poly.polygon.points.append(p)
+            self.footprint_pub.publish(poly)
 
 
 def main():
