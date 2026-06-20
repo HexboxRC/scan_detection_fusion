@@ -2,7 +2,7 @@
 """
 ab_fusion/fuser_node_v2.py
 
-LiDAR + Camera fusion node — v2 (TXSEF demo build)
+LiDAR + Camera fusion node — v2 
 
 Thin ROS wrapper around LidarCameraFuser.  All fusion/geometry math lives in
 lidar_camera_fuser.py; this file handles only subscriptions, publishers,
