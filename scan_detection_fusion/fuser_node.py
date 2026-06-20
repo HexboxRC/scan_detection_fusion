@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ab_fusion/fuser_node.py
+scan_detection_fusion/fuser_node.py
 
 Fuses 2D LiDAR scan with camera detections to produce named object
 positions in both robot-frame and map-frame coordinates.

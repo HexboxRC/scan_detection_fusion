@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ab_fusion/lidar_camera_fuser.py
+scan_detection_fusion/lidar_camera_fuser.py
 
 Pure LiDAR–camera fusion logic — rebuilt from fuser_node_v3.
 No rclpy or ROS message imports.  All inputs and outputs are plain Python / NumPy types.
@@ -60,7 +60,7 @@ class LidarCameraFuser:
     Construction example::
 
         import math
-        from ab_fusion.lidar_camera_fuser import LidarCameraFuser
+        from scan_detection_fusion.lidar_camera_fuser import LidarCameraFuser
 
         fuser = LidarCameraFuser(
             min_range        = 0.20,

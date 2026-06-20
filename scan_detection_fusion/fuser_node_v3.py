@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-ab_fusion/fuser_node_v3.py  —  LiDAR + Camera fusion node (v3, research build)
+scan_detection_fusion/fuser_node_v3.py  —  LiDAR + Camera fusion node — v3 with optional time-synchronized scan + detection (B5).
 ================================================================================
 
 Build & run
 -----------
-  # From the workspace root (one level above ab_fusion/):
-  colcon build --packages-select ab_fusion
+  # From the workspace root (one level above scan_detection_fusion/):
+  colcon build --packages-select scan_detection_fusion
   source install/setup.bash
-  ros2 run ab_fusion fuser_node_v3
+  ros2 run scan_detection_fusion fuser_node_v3
 
 Upstream nodes that must already be running
 -------------------------------------------
@@ -73,7 +73,7 @@ from tf2_ros import (Buffer, TransformListener,
                      LookupException, ConnectivityException, ExtrapolationException)
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 
-from ab_fusion.lidar_camera_fuser import LidarCameraFuser, quat_to_yaw
+from scan_detection_fusion.lidar_camera_fuser import LidarCameraFuser, quat_to_yaw
 
 
 # ── Node ──────────────────────────────────────────────────────────────────────

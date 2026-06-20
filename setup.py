@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'ab_fusion'
+package_name = 'scan_detection_fusion'
 
 setup(
     name=package_name,
@@ -19,9 +19,9 @@ setup(
     license='Apache-2.0',
     entry_points={
         'console_scripts': [
-            'fuser_node = ab_fusion.fuser_node:main',
-            'fuser_node_v2 = ab_fusion.fuser_node_v2:main',
-            'fuser_node_v3 = ab_fusion.fuser_node_v3:main',
+            'fuser_node = scan_detection_fusion.fuser_node:main',
+            'fuser_node_v2 = scan_detection_fusion.fuser_node_v2:main',
+            'fuser_node_v3 = scan_detection_fusion.fuser_node_v3:main',
         ],
     },
 )

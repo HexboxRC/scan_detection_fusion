@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-ab_fusion/fuser_node_v2.py
+scan_detection_fusion/fuser_node_v2.py
 
-LiDAR + Camera fusion node — v2 
+LiDAR + Camera fusion node — v2 with TF-based pose lookup (SLAM Toolbox compatible).
 
 Thin ROS wrapper around LidarCameraFuser.  All fusion/geometry math lives in
 lidar_camera_fuser.py; this file handles only subscriptions, publishers,
@@ -52,7 +52,7 @@ from builtin_interfaces.msg import Duration
 
 from tf2_ros import Buffer, TransformListener, LookupException, ConnectivityException, ExtrapolationException
 
-from ab_fusion.lidar_camera_fuser import LidarCameraFuser, quat_to_yaw
+from scan_detection_fusion.lidar_camera_fuser import LidarCameraFuser, quat_to_yaw
 
 
 # ── Node ──────────────────────────────────────────────────────────────────────

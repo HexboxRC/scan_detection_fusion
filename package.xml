@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>ab_fusion</name>
+  <name>scan_detection_fusion</name>
   <version>0.1.0</version>
   <description>LiDAR + camera fusion — named object positions on map</description>
   <maintainer email="aarav@todo.todo">aarav</maintainer>
