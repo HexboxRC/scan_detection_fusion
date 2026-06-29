@@ -17,15 +17,19 @@ Build & run
 Upstream nodes that must already be running
 -------------------------------------------
   • LiDAR driver          — publishes /scan (sensor_msgs/LaserScan)
-  • Camera detector node  — publishes /camera/detections (std_msgs/String, JSON)
+  • Camera detector node  — publishes /detections (vision_msgs/Detection2DArray)
+  • Camera driver         — publishes /camera_info (sensor_msgs/CameraInfo)  [optional]
   • SLAM Toolbox or AMCL  — broadcasts TF map → base_footprint
                             (AMCL also publishes /amcl_pose as a secondary source)
 
 Topics subscribed
 -----------------
-  /scan                   sensor_msgs/LaserScan          (overridable via topic_scan)
-  /camera/detections      std_msgs/String                (overridable via topic_detections)
-  /amcl_pose              geometry_msgs/PoseWithCovarianceStamped  (optional, overridable)
+  /scan          sensor_msgs/LaserScan                 (overridable via topic_scan)
+  /detections    vision_msgs/Detection2DArray          (overridable via topic_detections)
+  /camera_info   sensor_msgs/CameraInfo                (overridable via topic_camera_info;
+                                                        optional — used to derive HFOV from
+                                                        K[0] and image width)
+  /amcl_pose     geometry_msgs/PoseWithCovarianceStamped  (optional, overridable)
 
 Topics published
 ----------------
@@ -53,17 +57,25 @@ Key parameters and defaults
   camera_frame            'camera_link'  TF frame for the camera; used to derive
                                   parallax_dx/dy from TF at startup when
                                   use_parallax_correction is True
-  use_time_sync           False   enable ApproximateTimeSynchronizer
-  sync_slop_sec           0.05    time-sync tolerance window (s)
   use_spatial_keys        True    grid-cell EMA keys (prevents ID collisions)
   spatial_bin_size        0.75    grid cell size for spatial keys (m)
   publish_footprints      True    publish PolygonStamped on /object_footprints
   footprint_width_refine  True    widen footprint when LiDAR arc implies it
   footprint_refine_tol    0.20    tolerance before width override kicks in (fraction)
 
+  Camera geometry (pixel→angle conversion):
+  hfov_deg                60.0    horizontal field of view (°); fallback when
+                                  camera_info has not yet been received
+  image_width             640     image width in pixels; fallback when no camera_info
+
+  Note: the FOOTPRINT_TABLE and class routing in LidarCameraFuser are keyed by
+  string labels such as 'chair', 'person', 'sofa'.  The detector feeding this node
+  must emit those strings as class_id values in Detection2DArray.results[].
+
   Topic-name parameters (override to remap without a launch-file remapping rule):
   topic_scan              '/scan'
-  topic_detections        '/camera/detections'
+  topic_detections        '/detections'
+  topic_camera_info       '/camera_info'
   topic_amcl_pose         '/amcl_pose'
   topic_detected_objects  '/detected_objects'
   topic_object_markers    '/object_markers'
@@ -78,15 +90,15 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSHistoryPolicy
 
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, CameraInfo
 from std_msgs.msg import String
 from geometry_msgs.msg import PoseWithCovarianceStamped, PolygonStamped, Point32
 from visualization_msgs.msg import Marker, MarkerArray
 from builtin_interfaces.msg import Duration
+from vision_msgs.msg import Detection2DArray
 
 from tf2_ros import (Buffer, TransformListener,
                      LookupException, ConnectivityException, ExtrapolationException)
-from message_filters import ApproximateTimeSynchronizer, Subscriber
 
 from scan_detection_fusion.lidar_camera_fuser import LidarCameraFuser, quat_to_yaw
 
@@ -118,10 +130,6 @@ class FuserNode(Node):
         self.declare_parameter('parallax_dy',             0.0)
         self.declare_parameter('camera_frame',            'camera_link')
 
-        # ── Parameters: timestamp synchronization ─────────────────────────────
-        self.declare_parameter('use_time_sync',           False)
-        self.declare_parameter('sync_slop_sec',           0.05)
-
         # ── Parameters: spatial-bin EMA keys ─────────────────────────────────
         self.declare_parameter('use_spatial_keys',        True)
         self.declare_parameter('spatial_bin_size',        0.75)
@@ -131,9 +139,14 @@ class FuserNode(Node):
         self.declare_parameter('footprint_width_refine',  True)
         self.declare_parameter('footprint_refine_tol',    0.20)
 
+        # ── Parameters: camera geometry (pixel→angle) ─────────────────────────
+        self.declare_parameter('hfov_deg',                62.0)
+        self.declare_parameter('image_width',             640)
+
         # ── Parameters: topic names ───────────────────────────────────────────
         self.declare_parameter('topic_scan',              '/scan')
-        self.declare_parameter('topic_detections',        '/camera/detections')
+        self.declare_parameter('topic_detections',        '/detections')
+        self.declare_parameter('topic_camera_info',       '/camera_info')
         self.declare_parameter('topic_amcl_pose',         '/amcl_pose')
         self.declare_parameter('topic_detected_objects',  '/detected_objects')
         self.declare_parameter('topic_object_markers',    '/object_markers')
@@ -160,9 +173,6 @@ class FuserNode(Node):
         parallax_dy  = float(self.get_parameter('parallax_dy').value)
         self.camera_frame = str(self.get_parameter('camera_frame').value)
 
-        self.use_time_sync = bool(self.get_parameter('use_time_sync').value)
-        self.sync_slop     = float(self.get_parameter('sync_slop_sec').value)
-
         use_spatial_keys = bool(self.get_parameter('use_spatial_keys').value)
         spatial_bin_size = float(self.get_parameter('spatial_bin_size').value)
 
@@ -170,8 +180,12 @@ class FuserNode(Node):
         footprint_width_refine  = bool(self.get_parameter('footprint_width_refine').value)
         footprint_refine_tol    = float(self.get_parameter('footprint_refine_tol').value)
 
+        self._param_hfov_deg    = float(self.get_parameter('hfov_deg').value)
+        self._param_image_width = int(self.get_parameter('image_width').value)
+
         topic_scan              = str(self.get_parameter('topic_scan').value)
         topic_detections        = str(self.get_parameter('topic_detections').value)
+        topic_camera_info       = str(self.get_parameter('topic_camera_info').value)
         topic_amcl_pose         = str(self.get_parameter('topic_amcl_pose').value)
         topic_detected_objects  = str(self.get_parameter('topic_detected_objects').value)
         topic_object_markers    = str(self.get_parameter('topic_object_markers').value)
@@ -205,6 +219,13 @@ class FuserNode(Node):
         self.robot_yaw:  float = 0.0
         self.has_pose:   bool  = False
 
+        # ── Camera geometry state ─────────────────────────────────────────────
+        # Set by _cb_camera_info when calibration arrives; until then
+        # _pixels_to_angles falls back to hfov_deg + image_width parameters.
+        self._camera_fx:   float | None = None   # focal length in pixels (K[0])
+        self._camera_img_w: int | None  = None   # image width from CameraInfo
+        self._logged_fallback_source = False      # emit the fallback warning at most once
+
         # ── TF2 listener (primary pose source — works with SLAM + AMCL) ──────
         self.tf_buffer   = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -221,24 +242,9 @@ class FuserNode(Node):
         )
 
         # ── Subscribers ──────────────────────────────────────────────────────
-        if self.use_time_sync:
-            # Synchronized scan + detections; TF lookup at detection stamp
-            self.scan_sub = Subscriber(self, LaserScan, topic_scan,        qos_profile=sensor_qos)
-            self.det_sub  = Subscriber(self, String,    topic_detections)
-            self.sync = ApproximateTimeSynchronizer(
-                [self.scan_sub, self.det_sub],
-                queue_size=10,
-                slop=self.sync_slop,
-                allow_headerless=True   # String has no native header; JSON timestamp used
-            )
-            self.sync.registerCallback(self._cb_synced)
-            self.get_logger().info(f'Time-sync ENABLED, slop={self.sync_slop:.3f}s')
-        else:
-            # Default: independent callbacks, TF lookup at publish time
-            self.create_subscription(LaserScan, topic_scan,        self._cb_scan,       sensor_qos)
-            self.create_subscription(String,    topic_detections,  self._cb_detections, 10)
-
-        # /amcl_pose kept as secondary pose source (works alongside SLAM TF)
+        self.create_subscription(LaserScan,        topic_scan,        self._cb_scan,        sensor_qos)
+        self.create_subscription(Detection2DArray, topic_detections,  self._cb_detections,  10)
+        self.create_subscription(CameraInfo,       topic_camera_info, self._cb_camera_info, 10)
         self.create_subscription(
             PoseWithCovarianceStamped, topic_amcl_pose, self._cb_amcl_pose, 10
         )
@@ -259,13 +265,13 @@ class FuserNode(Node):
             f'  parallax={self.fuser.use_parallax} '
             f'dx={self.fuser.parallax_dx} dy={self.fuser.parallax_dy}  '
             f'camera_frame={self.camera_frame}\n'
-            f'  time_sync={self.use_time_sync}  '
-            f'footprints={self.publish_footprints}\n'
+            f'  footprints={self.publish_footprints}\n'
             f'  stale={self.fuser.stale_sec}s  '
             f'range=[{self.fuser.min_range},{self.fuser.max_range}]m  '
             f'expand=±{math.degrees(self.fuser.angle_expand):.1f}°  hz={self.pub_hz}\n'
+            f'  hfov_fallback={self._param_hfov_deg}°  img_w_fallback={self._param_image_width}px\n'
             f'  topics: scan={topic_scan}  det={topic_detections}  '
-            f'out={topic_detected_objects}'
+            f'camera_info={topic_camera_info}  out={topic_detected_objects}'
         )
 
     # ── Startup: TF-derived parallax offset ───────────────────────────────────
@@ -329,7 +335,7 @@ class FuserNode(Node):
         """
         Primary pose update — lookup map → base_frame via TF2.
         Works with SLAM Toolbox (TF only) and AMCL (TF + /amcl_pose).
-        stamp: if provided, look up at that specific time (used in time-sync mode).
+        stamp: if provided, look up at that specific time.
         Returns True on success.
         """
         try:
@@ -348,25 +354,118 @@ class FuserNode(Node):
         except (LookupException, ConnectivityException, ExtrapolationException):
             return False
 
+    # ── Camera geometry ───────────────────────────────────────────────────────
+
+    def _cb_camera_info(self, msg: CameraInfo):
+        """
+        Store camera intrinsics from the first valid CameraInfo message.
+        K = [fx, 0, cx, 0, fy, cy, 0, 0, 1]  (row-major, 9 elements).
+        Only K[0] (fx) and msg.width are used.
+        """
+        if self._camera_fx is not None:
+            return   # already calibrated; ignore subsequent messages
+        fx    = float(msg.k[0])
+        img_w = int(msg.width)
+        if fx <= 0.0 or img_w <= 0:
+            self.get_logger().warn(
+                f'CameraInfo has invalid fx={fx} or width={img_w}; ignoring'
+            )
+            return
+        self._camera_fx    = fx
+        self._camera_img_w = img_w
+        hfov_deg = math.degrees(2.0 * math.atan(img_w / (2.0 * fx)))
+        self.get_logger().info(
+            f'camera_info received: fx={fx:.1f} px  width={img_w} px  '
+            f'→ hfov={hfov_deg:.1f}°  (pixel→angle source: camera_info)'
+        )
+
+    def _pixels_to_angles(self, bbox_cx: float, bbox_w: float) -> tuple:
+        """
+        Convert a bounding-box pixel center and width to bearing angles.
+
+        Priority: camera_info (K[0] + image width) → hfov_deg + image_width params.
+        Logs which source is in use: camera_info logs on first receipt in
+        _cb_camera_info; parameter fallback logs here on first call.
+
+        Convention (matches ROS LaserScan angle convention):
+          forward = 0,  left = positive (CCW),  right = negative (CW).
+
+        Args:
+            bbox_cx:  horizontal pixel coordinate of the bbox center
+            bbox_w:   horizontal pixel width of the bbox
+
+        Returns:
+            (center_angle, left_angle, right_angle) in radians,
+            where left_angle > center_angle > right_angle.
+        """
+        if self._camera_fx is not None:
+            fx    = self._camera_fx
+            img_w = self._camera_img_w
+        else:
+            img_w = self._param_image_width
+            fx    = (img_w / 2.0) / math.tan(math.radians(self._param_hfov_deg) / 2.0)
+            if not self._logged_fallback_source:
+                self.get_logger().warn(
+                    f'No camera_info yet; using parameter fallback '
+                    f'hfov={self._param_hfov_deg}° width={img_w}px '
+                    f'(pixel→angle source: parameters)'
+                )
+                self._logged_fallback_source = True
+
+        half = img_w / 2.0
+        center_angle = math.atan2(half - bbox_cx,               fx)
+        left_angle   = math.atan2(half - (bbox_cx - bbox_w / 2.0), fx)
+        right_angle  = math.atan2(half - (bbox_cx + bbox_w / 2.0), fx)
+        return center_angle, left_angle, right_angle
+
     # ── Scan / detection callbacks ────────────────────────────────────────────
 
     def _cb_scan(self, msg: LaserScan):
-        """Default mode: store latest scan for use at detection time."""
+        """Store latest scan for use when a detection batch arrives."""
         self.latest_scan = msg
 
-    def _cb_detections(self, msg: String):
-        """Default mode: fuse using latest stored scan and latest TF pose."""
+    def _cb_detections(self, msg: Detection2DArray):
+        """
+        Convert Detection2DArray → detection dicts and call fuser.fuse().
+
+        For each Detection2D in the array:
+          • label / confidence: highest-score entry in results[]
+          • center/left/right angles: derived from bbox pixel coords via _pixels_to_angles()
+        Detections with an empty results list are skipped.
+        """
         if self.latest_scan is None:
             return
-        try:
-            data = json.loads(msg.data)
-        except Exception as e:
-            self.get_logger().warn(f'Detection JSON parse error: {e}')
+
+        detections = []
+        for det in msg.detections:
+            if not det.results:
+                continue
+
+            # Highest-score hypothesis → label and confidence
+            best       = max(det.results, key=lambda h: h.hypothesis.score)
+            label      = best.hypothesis.class_id
+            confidence = float(best.hypothesis.score)
+
+            # Pixel-space bbox → bearing angles
+            bbox_cx = float(det.bbox.center.position.x)
+            bbox_w  = float(det.bbox.size.x)
+            center_angle, left_angle, right_angle = self._pixels_to_angles(bbox_cx, bbox_w)
+
+            detections.append({
+                'label':            label,
+                'friendly_label':   label,
+                'confidence':       confidence,
+                'center_angle_rad': center_angle,
+                'left_angle_rad':   left_angle,
+                'right_angle_rad':  right_angle,
+            })
+
+        if not detections:
             return
 
         scan = self.latest_scan
         self.fuser.fuse(
-            detections      = data.get('detections', []),
+            detections      = detections,
             ranges          = scan.ranges,
             angle_min       = scan.angle_min,
             angle_increment = scan.angle_increment,
@@ -376,46 +475,11 @@ class FuserNode(Node):
             has_pose        = self.has_pose,
         )
 
-    def _cb_synced(self, scan_msg: LaserScan, det_msg: String):
-        """
-        Time-sync mode: scan and detection arrive aligned.
-        TF is looked up at the camera capture timestamp from the JSON payload,
-        then fuse() is called with the timestamp-matched scan and pose.
-        """
-        self.latest_scan = scan_msg
-        try:
-            data = json.loads(det_msg.data)
-        except Exception as e:
-            self.get_logger().warn(f'Detection JSON parse error: {e}')
-            return
-
-        cap_t = data.get('timestamp', None)
-        if cap_t is not None:
-            stamp = rclpy.time.Time(
-                seconds=int(cap_t),
-                nanoseconds=int((cap_t - int(cap_t)) * 1e9)
-            )
-            self._update_pose_from_tf(stamp=stamp.to_msg())
-        else:
-            self._update_pose_from_tf()
-
-        self.fuser.fuse(
-            detections      = data.get('detections', []),
-            ranges          = scan_msg.ranges,
-            angle_min       = scan_msg.angle_min,
-            angle_increment = scan_msg.angle_increment,
-            robot_x         = self.robot_x,
-            robot_y         = self.robot_y,
-            robot_yaw       = self.robot_yaw,
-            has_pose        = self.has_pose,
-        )
-
     # ── Publish cycle ─────────────────────────────────────────────────────────
 
     def _publish_cb(self):
-        # Default mode: refresh pose from latest TF at publish rate
-        if not self.use_time_sync:
-            self._update_pose_from_tf()
+        # Refresh pose from latest TF at publish rate
+        self._update_pose_from_tf()
 
         # Expire stale objects
         now = time.time()
