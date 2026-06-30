@@ -428,7 +428,7 @@ class LidarCameraFuser:
     ) -> list:
         """
         Build a class-aware footprint polygon centred at (map_x, map_y),
-        oriented so the rectangle's long axis faces the robot.
+        oriented so the rectangle's broad axis faces the robot.
 
         Looks up nominal (W, D) in FOOTPRINT_TABLE[label].  If
         footprint_width_refine is True and the LiDAR arc implies a wider
