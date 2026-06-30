@@ -463,7 +463,7 @@ class LidarCameraFuser:
 
         hw = W / 2.0
         hd = D / 2.0
-        local_corners = [(-hw, -hd), (hw, -hd), (hw, hd), (-hw, hd)]
+        local_corners = [(-hd, -hw), (hd, -hw), (hd, hw), (-hd, hw)]
 
         c, s = math.cos(beta), math.sin(beta)
         return [
