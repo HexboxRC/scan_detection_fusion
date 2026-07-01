@@ -17,11 +17,10 @@ setup(
     maintainer_email='aarav@todo.todo',
     description='LiDAR + camera fusion node — produces named object map positions',
     license='Apache-2.0',
+    tests_require=['pytest'],
     entry_points={
         'console_scripts': [
             'fuser_node = scan_detection_fusion.fuser_node:main',
-            'fuser_node_v2 = scan_detection_fusion.fuser_node_v2:main',
-            'fuser_node_v3 = scan_detection_fusion.fuser_node_v3:main',
         ],
     },
 )
