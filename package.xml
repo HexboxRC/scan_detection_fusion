@@ -10,7 +10,7 @@
   </description>
 
   <!-- TODO: real maintainer; license is Aarav's call (Apache-2.0 or BSD-3-Clause) -->
-  <maintainer email="YOUR_EMAIL@example.com">Your Name</maintainer>
+  <maintainer email="aaravbansal.x@gmail.com">Aarav Bansal</maintainer>
   <license>Apache-2.0</license>
 
   <exec_depend>rclpy</exec_depend>
