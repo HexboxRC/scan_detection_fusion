@@ -448,7 +448,7 @@ class FuserNode(Node):
 
             # Pixel-space bbox → bearing angles
             bbox_cx = float(det.bbox.center.position.x)
-            bbox_w  = float(det.bbox.size.x)
+            bbox_w  = float(det.bbox.size_x)
             center_angle, left_angle, right_angle = self._pixels_to_angles(bbox_cx, bbox_w)
 
             detections.append({
